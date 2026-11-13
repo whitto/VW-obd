@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VW OBD Console</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui;background:#101619;color:#edf5f6;--muted:#a7b9bd;--line:#34454a;--accent:#89e8c5}
+*{box-sizing:border-box}body{margin:0}main{max-width:1020px;margin:auto;padding:40px 22px 60px}header{border-bottom:1px solid var(--line);padding-bottom:28px;margin-bottom:24px}h1{font-size:clamp(2.5rem,8vw,4.7rem);letter-spacing:-.075em;line-height:1;margin:12px 0 16px}h2{font-size:1.15rem;margin:0 0 15px}p{color:var(--muted);line-height:1.55;margin:8px 0}section{padding:22px;border:1px solid var(--line);border-radius:14px;background:#192226;margin-bottom:16px}button{font:inherit;font-weight:650;padding:10px 14px;border-radius:8px;border:1px solid var(--line);background:#26353a;color:inherit;cursor:pointer}button.primary{background:var(--accent);color:#102522;border-color:transparent}button.danger{color:#ffb9a8;border-color:#8f5d51}dialog{max-width:460px;width:calc(100% - 36px);border:1px solid var(--line);border-radius:14px;background:#192226;color:inherit;padding:22px}dialog::backdrop{background:#000a}button:disabled{opacity:.45;cursor:default}button:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}.metric{border-top:1px solid var(--line);padding-top:12px}.metric output{display:block;font-size:1.9rem;font-variant-numeric:tabular-nums}.label,small{color:var(--muted)}.fault{display:grid;grid-template-columns:minmax(84px,1fr) minmax(90px,1fr) 3fr;gap:10px;padding:12px 0;border-top:1px solid var(--line)}code{color:var(--accent)}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:240px;overflow:auto;color:var(--muted)}summary{cursor:pointer}#status{color:var(--accent)}
+</style>
+<main>
+<header><small>OBD-II DIAGNOSTICS</small><h1>VW OBD Console</h1><p>Read engine and emissions faults and check live sensor values from your Mac.</p></header>
+<section><h2>Adapter connection</h2><p>Park the car, plug in your BLE OBD adapter and switch the ignition on. Open this page in Chrome on macOS and allow Bluetooth access when prompted.</p><p id="status" role="status">Disconnected</p><div class="actions"><button class="primary" id="connect">Connect adapter</button><button id="demo">Try demo</button><button id="disconnect" disabled>Disconnect</button></div><p><small>Targets OBDLink CX and ELM-compatible BLE adapters with the FFF0 UART profile. Bluetooth Classic adapters require a different connection.</small></p></section>
+<section><h2>Fault codes</h2><p id="scanStatus" role="status">Connect an adapter or try the demo to scan.</p><p id="clearStatus" role="status"></p><div id="faults"></div><div class="actions"><button id="scan" disabled>Scan fault codes</button><button class="danger" id="clear" disabled>Clear codes</button></div><p><small>Standard OBD-II engine and emissions coverage. Use the experimental VW section below for module-specific requests.</small></p></section>
+<section><h2>VW KWP2000 · experimental</h2>
+<p>Golf Mk5 module diagnostics over TP 2.0. Requires an adapter that supports raw CAN and meets the module’s response timing. Physical vehicle testing is pending.</p>
+<label for="vwModule">Control module</label>
+<select id="vwModule" style="font:inherit;padding:10px;background:#26353a;color:inherit">
+<option value="01">01 · Engine</option><option value="03">03 · ABS brakes</option><option value="08">08 · Heating / air conditioning</option><option value="09">09 · Central electronics</option><option value="15">15 · Airbags</option><option value="16">16 · Steering wheel</option><option value="17">17 · Instruments</option><option value="19">19 · CAN gateway</option><option value="25">25 · Immobiliser</option><option value="42">42 · Driver door</option><option value="44">44 · Steering assistance</option><option value="46">46 · Central convenience</option><option value="52">52 · Passenger door</option><option value="56">56 · Radio</option>
+</select><div class="actions"><button id="vwRead" disabled>Read module faults</button><button id="vwClear" class="danger" disabled>Clear module faults</button></div>
+<p id="vwStatus" role="status">Select a module after connecting.</p><div id="vwFaults"></div>
+<p><small>Common VW fault descriptions are included. Status labels use the ISO 14230 interpretation, which is unverified for each VW module. Raw values remain visible. A failed connection means the fault state is unknown.</small></p></section>
+<dialog id="vwConfirm" aria-labelledby="vwClearTitle"><form method="dialog"><h2 id="vwClearTitle">Clear module faults?</h2><p id="vwClearText"></p><div class="actions"><button value="cancel" autofocus>Cancel</button><button class="danger" value="clear">Clear module faults</button></div></form></dialog>
+<section><h2>Live readings</h2><div class="grid"><div class="metric"><span class="label">Engine speed</span><output id="rpm">—</output></div><div class="metric"><span class="label">Coolant temperature</span><output id="coolant">—</output></div><div class="metric"><span class="label">Vehicle speed</span><output id="speed">—</output></div></div><div class="actions"><button id="live" disabled>Start live readings</button></div></section>
+<section><details><summary>Adapter responses</summary><pre id="log">No responses yet.</pre></details></section>
+<dialog id="confirmClear" aria-labelledby="clearTitle">
+<form method="dialog">
+<h2 id="clearTitle">Clear engine fault codes?</h2>
+<p id="clearDetails"></p>
+<div class="actions"><button value="cancel" autofocus>Cancel</button><button class="danger" value="clear">Clear codes</button></div>
+</form>
+</dialog>
+</main>
+<script>
+'use strict';
+// KWP2000 over Volkswagen TP 2.0. ELM command transport supplies raw CAN frames.
+class VWDiagnostic {
+  constructor(command) { this.command = command; this.tx = 0; this.rx = 0; this.opened = false; }
+  static hex(value, width = 2) { return value.toString(16).toUpperCase().padStart(width, '0'); }
+  async setting(command) {
+    const reply = await this.command(command);
+    if (!/\bOK\b/.test(reply)) throw new Error('Adapter rejected ' + command + '. Raw CAN support is required.');
+  }
+  async frame(bytes) {
+    const reply = await this.command(bytes.map(value => VWDiagnostic.hex(value)).join(''));
+    if (/ERROR|STOPPED|BUS BUSY|BUFFER FULL|\?/.test(reply)) throw new Error('CAN exchange failed: ' + reply.trim());
+    const frames = [];
+    for (const line of reply.split(/[\r\n]+/)) {
+      const compact = line.replace(/\s/g, '');
+      if (/^[0-9A-F]{5,19}$/i.test(compact) && compact.length % 2 === 1) {
+        const id = parseInt(compact.slice(0,3),16);
+        if (id === this.receiveId) frames.push(compact.slice(3).match(/../g).map(byte => parseInt(byte,16)));
+      }
+    }
+    return frames;
+  }
+  async open(address) {
+    for (const command of ['ATPC','ATSP6','ATH1','ATS1','ATD0','ATCAF0','ATCFC0','ATAT0','ATST05','ATSH200','ATCRA'+VWDiagnostic.hex(0x200+address,3)]) await this.setting(command);
+    this.receiveId = 0x200 + address;
+    const setup = (await this.frame([address,0xC0,0,0x10,0,3,1])).find(frame => frame[0] === 0 && frame[1] === 0xD0);
+    if (!setup || setup.length !== 7 || setup[6] !== 1 || (setup[3]&0xF8) || (setup[5]&0xF8)) throw new Error('Module did not establish a TP 2.0 channel. It may be absent or incompatible with this adapter.');
+    this.receiveId = setup[2] | setup[3]<<8;
+    this.sendId = setup[4] | setup[5]<<8;
+    await this.setting('ATSH'+VWDiagnostic.hex(this.sendId,3));
+    await this.setting('ATCRA'+VWDiagnostic.hex(this.receiveId,3));
+    this.opened = true;
+    const parameters = (await this.frame([0xA0,0x0F,0x8A,0xFF,0x0A,0xFF])).find(frame => frame[0] === 0xA1);
+    if (!parameters || parameters.length !== 6 || !parameters[1]) throw new Error('Module did not negotiate TP 2.0 timing.');
+    const units = [0.1,1,10,100];
+    this.gap = units[parameters[4]>>6]*(parameters[4]&63);
+    this.tx = 0; this.rx = 0;
+    await this.request([0x10,0x89]);
+  }
+  async request(payload) {
+    if (!this.opened || payload.length > 5) throw new Error('Invalid diagnostic request.');
+    await new Promise(resolve => setTimeout(resolve,this.gap));
+    const sequence = this.tx;
+    this.tx = (this.tx + 1) & 15;
+    let frames = await this.frame([0x10|sequence,0,payload.length,...payload]);
+    let acknowledged = false, expectedLength = null, data = [], complete = false;
+    const deadline = Date.now()+4000;
+    for (let turn=0;turn<64 && Date.now()<deadline;turn++) {
+      let ack = null;
+      for (const frame of frames) {
+        const op = frame[0]>>4, seq = frame[0]&15;
+        if (op === 0xB) { if (seq !== this.tx) throw new Error('Unexpected TP acknowledgement.'); acknowledged = true; continue; }
+        if (frame[0] === 0xA8) throw new Error('Module closed the diagnostic channel.');
+        if (op > 3) continue;
+        if (complete) throw new Error('Unexpected extra diagnostic response.');
+        if (seq !== this.rx) throw new Error('Missing or out-of-order TP response frame.');
+        this.rx = (this.rx+1)&15;
+        let offset = 1;
+        if (expectedLength === null) {
+          if (frame.length < 3) throw new Error('Incomplete TP length.');
+          expectedLength = frame[1]*256+frame[2]; offset = 3;
+          if (!expectedLength || expectedLength > 4096) throw new Error('Invalid TP message length.');
+        }
+        data.push(...frame.slice(offset));
+        if (op === 0 || op === 1) ack = 0xB0|this.rx;
+        if (op === 1 || op === 3) {
+          if (data.length !== expectedLength) throw new Error('Incomplete diagnostic response.');
+          complete = true;
+        }
+      }
+      if (ack !== null) frames = await this.frame([ack]);
+      else frames = [];
+      if (complete) {
+        if (!acknowledged) throw new Error('Diagnostic request acknowledgement missing.');
+        if (data[0] === 0x7F) throw new Error('Module rejected service '+VWDiagnostic.hex(data[1])+', response '+VWDiagnostic.hex(data[2])+'.');
+        if (data[0] !== payload[0]+0x40) throw new Error('Unexpected diagnostic service response.');
+        return data;
+      }
+      if (!frames.length) throw new Error('Diagnostic response timed out or exceeded adapter timing capabilities.');
+    }
+    throw new Error('Diagnostic response limit reached.');
+  }
+  async readFaults() {
+    const data = await this.request([0x18,0x02,0xFF,0x00]);
+    if (data.length < 2 || data.length !== 2+data[1]*3) throw new Error('Unsupported fault record format. Raw responses are available below.');
+    const faults = [];
+    for (let i=2;i<data.length;i+=3) faults.push({number:data[i]*256+data[i+1],status:data[i+2]});
+    return faults;
+  }
+  async clearFaults() { await this.request([0x14,0xFF,0x00]); }
+  async close() {
+    try { if (this.opened) await this.frame([0xA8]); }
+    finally { this.opened = false; }
+  }
+}
+if (typeof module !== 'undefined') module.exports = VWDiagnostic;
+
+</script>
+<script>
+'use strict';
+const VWFaults = {
+  entries: {
+    532: ['Battery supply voltage (B+)','00532'],
+    778: ['Steering angle sensor (G85)','00778'],
+    928: ['Driver door locking unit (F220)','00928'],
+    1217: ['Driver front side-airbag igniter (N199)','01217'],
+    1314: ['Engine control module','01314'],
+    1316: ['ABS control module','01316']
+  },
+  describe(number) {
+    const entry = this.entries[number];
+    return entry ? {title:entry[0],url:'https://wiki.ross-tech.com/wiki/index.php/'+entry[1]} :
+      {title:'VW fault description unavailable',url:null};
+  },
+  status(byte) {
+    // ISO 14230 service 18 interpretation. Module-specific encoding remains unverified.
+    if (byte & 15) return 'Module-specific status — interpretation unavailable';
+    const states = ['No fault detected at request','Stored fault — currently absent','Pending fault — confirmation incomplete','Active and stored fault'];
+    const state = states[(byte >> 5)&3];
+    return state+' · '+(byte&16 ? 'Test incomplete' : 'Test complete')+' · '+
+      (byte&128 ? 'Warning indicator requested' : 'No warning indicator requested');
+  }
+};
+if (typeof module !== 'undefined') module.exports = VWFaults;
+
+</script>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const serviceId = 0xfff0, notifyId = 0xfff1, writeId = 0xfff2;
+const encoder = new TextEncoder(), decoder = new TextDecoder();
+const descriptions = {P0300:'Random or multiple cylinder misfire detected',P0301:'Cylinder 1 misfire detected',P0420:'Catalyst efficiency below threshold (bank 1)',P0171:'System too lean (bank 1)',P0299:'Turbocharger or supercharger underboost',P0456:'EVAP system very small leak detected'};
+const readings = [
+  ['010C','rpm',2,([a,b]) => (a*256+b)/4,'rpm'],
+  ['0105','coolant',1,([a]) => a-40,'°C'],
+  ['010D','speed',1,([a]) => a,'km/h']
+];
+let device, writer, pending, mode, busy = false, live = false, can = false;
+const trace = [];
+let demoCleared = false;
+let verifiedModule = null;
+const demoModuleCleared = new Set();
+function log(command, response) {
+  trace.push(command+' → '+response.trim());
+  if (trace.length > 35) trace.shift();
+  $('log').textContent = trace.join('\n');
+}
+function controls() {
+  $('connect').disabled = busy || !!mode || !navigator.bluetooth;
+  $('demo').disabled = busy || !!mode;
+  $('disconnect').disabled = !mode;
+  $('scan').disabled = !mode || busy || live;
+  $('clear').disabled = !mode || busy || live;
+  $('live').disabled = !mode || (busy && !live);
+  $('vwRead').disabled = !mode || busy || live;
+  $('vwModule').disabled = busy || live;
+  $('vwClear').disabled = !mode || busy || live || (verifiedModule !== $('vwModule').value || verifiedModule === '15');
+  $('live').textContent = live ? 'Stop live readings' : 'Start live readings';
+}
+function stop(message) {
+  live = false;
+  if ($('confirmClear').open) $('confirmClear').close('cancel');
+  verifiedModule = null;
+  if ($('vwConfirm').open) $('vwConfirm').close('cancel');
+  mode = null;
+  writer = null;
+  if (pending) pending.fail(new Error(message));
+  const oldDevice = device;
+  device = null;
+  oldDevice?.gatt.disconnect();
+  $('status').textContent = message;
+  controls();
+}
+function notify(event) {
+  if (!pending || event.target.service.device !== device) return;
+  pending.buffer += decoder.decode(event.target.value);
+  const prompt = pending.buffer.indexOf('>');
+  if (prompt >= 0) pending.finish(pending.buffer.slice(0,prompt));
+}
+function command(code) {
+  if (mode === 'demo') {
+    if (code === '04') demoCleared = true;
+    const demo = {'04':'44','03':demoCleared ? '43 00' : '43 02 03 01 04 20','07':demoCleared ? '47 00' : '47 01 02 99','0A':'4A 01 04 20','010C':'41 0C 0D 20','0105':'41 05 82','010D':'41 0D 00'};
+    const reply = demo[code] ?? 'NO DATA';
+    log(code,reply);
+    return Promise.resolve(reply);
+  }
+  if (!writer || !device?.gatt.connected || pending) return Promise.reject(new Error('Adapter is unavailable.'));
+  return new Promise((resolve,reject) => {
+    const timer = setTimeout(() => stop('Adapter response timed out. Reconnect to retry.'),6500);
+    pending = {
+      buffer:'',
+      fail(error) { clearTimeout(timer); pending = null; reject(error); },
+      finish(reply) { clearTimeout(timer); pending = null; log(code,reply); resolve(reply); }
+    };
+    const request = pending, bytes = encoder.encode(code+'\r');
+    const write = writer.properties.write ? writer.writeValueWithResponse(bytes) : writer.writeValueWithoutResponse(bytes);
+    write.catch(error => { if (pending === request) stop('Bluetooth write failed. '+error.message); });
+  });
+}
+function lines(raw) {
+  const result = [];
+  let multi = '';
+  for (const line of raw.split(/[\r\n]+/)) {
+    const value = line.trim();
+    const indexed = value.match(/^([0-9a-f]+):\s*([0-9a-f ]+)$/i);
+    if (indexed) {
+      if (indexed[1] === '0' && multi) { result.push(multi); multi = ''; }
+      multi += indexed[2].replaceAll(' ','').toUpperCase();
+    } else {
+      if (multi) { result.push(multi); multi = ''; }
+      if (/^[0-9a-f ]+$/i.test(value)) result.push(value.replaceAll(' ','').toUpperCase());
+    }
+  }
+  if (multi) result.push(multi);
+  return result.filter(value => value.length % 2 === 0);
+}
+function troubleCodes(raw, prefix, counted) {
+  const codes = new Set();
+  const messages = lines(raw).filter(line => line.startsWith(prefix));
+  for (const line of messages) {
+    const size = counted ? parseInt(line.slice(2,4),16) : (line.length-2)/4;
+    const start = counted ? 4 : 2;
+    if (!Number.isInteger(size) || line.length < start+size*4) throw new Error('Incomplete fault-code response.');
+    for (let i=0;i<size;i++) {
+      const pair = line.slice(start+i*4,start+i*4+4);
+      if (pair === '0000') continue;
+      const high = parseInt(pair[0],16);
+      codes.add('PCBU'[high>>2]+(high&3)+pair.slice(1));
+    }
+  }
+  return messages.length ? [...codes] : null;
+}
+function resetView() {
+  trace.length = 0;
+  demoCleared = false;
+  verifiedModule = null; demoModuleCleared.clear();
+  $('vwFaults').replaceChildren();
+  $('vwStatus').textContent = 'Select a module to read its faults.';
+  $('clearStatus').textContent = '';
+  $('log').textContent = 'No responses yet.';
+  $('faults').replaceChildren();
+  $('scanStatus').textContent = 'Ready to scan.';
+  for (const [,id] of readings) $(id).textContent = '—';
+}
+$('connect').onclick = async () => {
+  busy = true; controls(); resetView();
+  $('status').textContent = 'Choose your OBD adapter…';
+  try {
+    device = await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:[serviceId]});
+    const selected = device;
+    device.addEventListener('gattserverdisconnected',() => {
+      if (device === selected) stop('Adapter disconnected.');
+    },{once:true});
+    const gatt = await device.gatt.connect();
+    const service = await gatt.getPrimaryService(serviceId);
+    const receiver = await service.getCharacteristic(notifyId);
+    writer = await service.getCharacteristic(writeId);
+    receiver.addEventListener('characteristicvaluechanged',notify);
+    await receiver.startNotifications();
+    $('status').textContent = 'Bluetooth connected. Detecting vehicle protocol…';
+    for (const code of ['ATZ','ATE0','ATL0','ATH0','ATS1','ATSP0']) {
+      const reply = await command(code);
+      if (code !== 'ATZ' && !/\bOK\b/i.test(reply)) throw new Error('Adapter rejected '+code+'.');
+    }
+    const probe = await command('0100');
+    if (!lines(probe).some(line => /^4100[0-9A-F]{8}/.test(line))) throw new Error('No OBD-II response. Check ignition and adapter connection.');
+    const protocol = (await command('ATDPN')).trim().toUpperCase().replace(/^A(?=.)/,'');
+    if (!/^[1-9]$/.test(protocol)) throw new Error('Unsupported or unknown vehicle protocol ('+protocol+').');
+    can = /^[6-9]$/.test(protocol);
+    mode = 'vehicle';
+    $('status').textContent = 'Connected to '+(device.name || 'OBD adapter');
+  } catch (error) {
+    stop(error.name === 'NotFoundError' ? 'No adapter selected.' : 'Connection ended. '+error.message);
+  } finally { busy = false; controls(); }
+};
+$('demo').onclick = () => { resetView(); mode = 'demo'; can = true; $('status').textContent = 'Demo mode · simulated data'; controls(); $('scan').click(); };
+$('disconnect').onclick = () => stop('Disconnected. Previous results remain visible.');
+$('clear').onclick = () => {
+  $('clearDetails').textContent = mode === 'demo'
+    ? 'This clears simulated stored and pending codes. The simulated permanent code will remain.'
+    : 'Park the car, stop the engine and leave the ignition on. This clears stored and pending engine and emissions codes, erases freeze-frame data, and resets emissions readiness monitors. Permanent codes remain until the car verifies the repair.';
+  $('confirmClear').returnValue = 'cancel';
+  $('confirmClear').showModal();
+};
+$('confirmClear').onclose = async () => {
+  if ($('confirmClear').returnValue !== 'clear' || !mode || busy || live) return;
+  busy = true;
+  controls();
+  $('clearStatus').textContent = 'Sending clear request…';
+  try {
+    const reply = await command('04');
+    const acknowledged = lines(reply).some(line => /^44(?:00)*$/.test(line));
+    $('clearStatus').textContent = acknowledged
+      ? 'Clear request acknowledged. See the rescan below.'
+      : 'The car did not acknowledge the clear request. Check the rescan below.';
+  } catch (error) {
+    $('clearStatus').textContent = 'Clear result unknown. ' + error.message;
+  } finally {
+    busy = false;
+    controls();
+  }
+  if (mode) await scan();
+};
+async function scan() {
+  busy = true; controls();
+  $('scanStatus').textContent = 'Scanning…';
+  $('faults').replaceChildren();
+  const missing = [];
+  let count = 0;
+  try {
+    for (const [request,prefix,kind] of [['03','43','Stored'],['07','47','Pending'],['0A','4A','Permanent']]) {
+      const found = troubleCodes(await command(request),prefix,can);
+      if (!found) { missing.push(kind.toLowerCase()); continue; }
+      for (const code of found) {
+        const row = document.createElement('div'); row.className = 'fault';
+        for (const [tag,value] of [['code',code],['span',kind],['span',descriptions[code] || 'Description unavailable']]) {
+          const item = document.createElement(tag); item.textContent = value; row.append(item);
+        }
+        $('faults').append(row); count++;
+      }
+    }
+    $('scanStatus').textContent = (count ? count+' fault entries found.' : 'No faults reported by responding services.') + (missing.length ? ' No usable response for '+missing.join(', ')+' codes.' : '');
+    if (missing.length === 3) $('scanStatus').textContent = 'No fault-code services returned usable data.';
+  } catch (error) { $('scanStatus').textContent = 'Scan interrupted. '+error.message; }
+  finally { busy = false; controls(); }
+}
+$('scan').onclick = scan;
+$('live').onclick = async () => {
+  if (live) { live = false; controls(); return; }
+  live = true; busy = true; controls();
+  try {
+    while (live && mode) {
+      for (const [request,id,length,convert,unit] of readings) {
+        if (!live || !mode) break;
+        const prefix = '41'+request.slice(2);
+        const row = lines(await command(request)).find(line => line.startsWith(prefix) && line.length >= 4+length*2);
+        const bytes = row?.slice(4,4+length*2).match(/../g).map(hex => parseInt(hex,16));
+        $(id).textContent = bytes ? convert(bytes)+' '+unit : 'Unavailable';
+      }
+      if (live) await new Promise(resolve => setTimeout(resolve,900));
+    }
+  } catch (error) { if (mode) $('status').textContent = 'Live readings interrupted. '+error.message; }
+  finally { busy = false; live = false; controls(); }
+};
+
+$('vwModule').onchange = () => {
+  verifiedModule = null;
+  $('vwFaults').replaceChildren();
+  $('vwStatus').textContent = 'Ready to read the selected module.';
+  controls();
+};
+async function restoreOBD() {
+  for (const code of ['ATPC','ATD','ATE0','ATL0','ATH0','ATS1','ATSP0']) {
+    const reply = await command(code);
+    if (!/\bOK\b/.test(reply)) throw new Error('Adapter could not restore standard OBD mode.');
+  }
+  const probe = await command('0100');
+  if (!lines(probe).some(line => /^4100[0-9A-F]{8}/.test(line))) throw new Error('Vehicle did not reconnect to standard OBD.');
+  const protocol = (await command('ATDPN')).trim().toUpperCase().replace(/^A(?=.)/,'');
+  if (!/^[1-9]$/.test(protocol)) throw new Error('Unknown OBD protocol after reconnect.');
+  can = /^[6-9]$/.test(protocol);
+}
+async function vwOperation(clear = false) {
+  if (!mode || busy || live) return;
+  if (clear && $('vwModule').value === '15') return;
+  const address = $('vwModule').value;
+  busy = true; verifiedModule = null; controls();
+  $('vwFaults').replaceChildren();
+  $('vwStatus').textContent = clear ? 'Clearing module '+address+'…' : 'Reading module '+address+'…';
+  const session = new VWDiagnostic(command);
+  let clearAccepted = false;
+  try {
+    let faults;
+    if (mode === 'demo') {
+      if (clear) demoModuleCleared.add(address);
+      clearAccepted = clear;
+      faults = demoModuleCleared.has(address) ? [] : [{number:1314,status:0x20}];
+    } else {
+      await session.open(parseInt(address,16));
+      if (clear) { await session.clearFaults(); clearAccepted = true; }
+      faults = await session.readFaults();
+    }
+    for (const fault of faults) {
+      const description = VWFaults.describe(fault.number);
+      const row = document.createElement('div'); row.className = 'fault';
+      for (const text of [String(fault.number).padStart(5,'0'),description.title,'KWP interpretation: '+VWFaults.status(fault.status)+' (status 0x'+VWDiagnostic.hex(fault.status)+', DTC 0x'+VWDiagnostic.hex(fault.number,4)+')']) {
+        const span = document.createElement('span'); span.textContent = text; row.append(span);
+      }
+      if (description.url) {
+        const link = document.createElement('a');
+        link.href = description.url; link.target = '_blank'; link.rel = 'noopener noreferrer';
+        link.textContent = 'Fault reference'; link.style.color = 'var(--accent)';
+        row.append(link);
+      }
+      $('vwFaults').append(row);
+    }
+    verifiedModule = address;
+    $('vwStatus').textContent = (mode === 'demo' ? 'Simulated module '+address+'. ' : 'Module '+address+'. ') +
+      (clearAccepted ? 'Clear acknowledged. Rescan found ' : 'Reported ') + faults.length+' fault records.' +
+      (address === '15' ? ' Airbag clearing is disabled because certain igniter faults require a repair-manual procedure before clearing.' : '');
+  } catch (error) {
+    $('vwStatus').textContent = (clearAccepted ? 'Clear acknowledged; rescan failed. ' : clear ? 'Clear result unconfirmed. ' : 'Module fault state unknown. ') + error.message;
+  } finally {
+    if (mode === 'vehicle') {
+      try { await session.close(); await restoreOBD(); }
+      catch (error) { stop('Reconnect required. '+error.message); }
+    }
+    busy = false; controls();
+  }
+}
+$('vwRead').onclick = () => vwOperation();
+$('vwClear').onclick = () => {
+  if (verifiedModule !== $('vwModule').value) return;
+  $('vwClearText').textContent = 'Clear recorded faults in module '+verifiedModule+' and rescan it. Park the car with the engine off and ignition on. Save any fault details you need before clearing. Active faults may return.';
+  $('vwConfirm').returnValue = 'cancel';
+  $('vwConfirm').showModal();
+};
+$('vwConfirm').onclose = () => {
+  if ($('vwConfirm').returnValue === 'clear' && verifiedModule === $('vwModule').value) return vwOperation(true);
+};
+
+if (!navigator.bluetooth) $('status').textContent = 'Bluetooth unavailable here. Open the HTTPS page directly in Chrome on macOS, or try the demo.';
+controls();
+</script>
+</html>
